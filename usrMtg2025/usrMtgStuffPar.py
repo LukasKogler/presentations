@@ -7,10 +7,14 @@ from netgen.geom2d import unit_square
 from ngsolve.meshes import MakeStructured2DMesh, MakeStructured3DMesh
 from ngsolve import *
 from netgen.occ import *
+import mpi4py.MPI as MPI
 
+def mPrint(*args):
+    # if MPI.COMM_WORLD.size == 1 or MPI.COMM_WORLD.rank == 1:
+    if MPI.COMM_WORLD.rank == 1:
+        print(*args)
 
 def gen_ref_mesh (geo, maxh, nref, comm, mesh_file = '', save = False, load = False):
-    ngs.ngsglobals.msg_level = 1
     if load:
         ngm = ng.meshing.Mesh(comm=comm)
         ngm.Load(mesh_file)
@@ -22,6 +26,7 @@ def gen_ref_mesh (geo, maxh, nref, comm, mesh_file = '', save = False, load = Fa
             if comm.size > 0:
                 ngm.Distribute(comm)
         else:
+            ngs.ngsglobals.msg_level = 0
             ngm = ng.meshing.Mesh.Receive(comm)
             ngm.SetGeometry(geo)
     for l in range(nref):
@@ -30,10 +35,11 @@ def gen_ref_mesh (geo, maxh, nref, comm, mesh_file = '', save = False, load = Fa
 
 
 def setupH1Square(maxh=0.1, order=1, nref=0):
-    ngmesh = unit_square.GenerateMesh(maxh=maxh)
-    for l in range(nref):
-        ngmesh.Refine()
-    mesh = ngs.Mesh(ngmesh)
+    geo, mesh = gen_ref_mesh(unit_square, maxh=maxh, nref=nref, comm=MPI.COMM_WORLD)
+    # ngmesh = unit_square.GenerateMesh(maxh=maxh)
+    # for l in range(nref):
+    #     ngmesh.Refine()
+    # mesh = ngs.Mesh(ngmesh)
     V = ngs.H1(mesh, order=order, dirichlet=".*")
     u,v = V.TnT()
     a = ngs.BilinearForm(V)
@@ -85,23 +91,32 @@ def setupElastBeam(N=3, aRatio=10, pRatio = 0.1, elStretch=1, order=1, nodalP2=F
     gfu = ngs.GridFunction(V)
     return V, a, f, gfu
 
-
 def testAndSolve(A, c, u, f, doTest=True, tol=1e-6):
     evsA = ngs.la.EigenValues_Preconditioner(mat=A, pre=c)
     kappa = evsA[-1]/evsA[0]
-    print("Preconditioner test:")
-    print(f"   min EV = {evsA[0]}")
-    print(f"   max EV = {evsA[-1]}")
-    print(f"   condition = {kappa}")
-    print("")
-    print("")
 
-    sol = ngs.krylovspace.CGSolver(mat=A, pre=c, tol=tol, printrates=True)
+    if MPI.COMM_WORLD.rank == 0:
+        mPrint("Preconditioner test:")
+        mPrint(f"   min EV = {evsA[0]}")
+        mPrint(f"   max EV = {evsA[-1]}")
+        mPrint(f"   condition = {kappa}")
+        mPrint("")
+        mPrint("")
 
-    print("Solve...")
+    doPrint = MPI.COMM_WORLD.rank==0
+    sol = ngs.krylovspace.CGSolver(mat=A, pre=c, tol=tol, printrates=doPrint)
+
+    if MPI.COMM_WORLD.rank == 0:
+        mPrint("Solve...")
+
     t = ngs.Timer("AMG - Solve")
+
+    MPI.COMM_WORLD.Barrier()
     t.Start()
+
     u.data = sol * f
+
+    MPI.COMM_WORLD.Barrier()
     t.Stop()
 
     tsup = -1
@@ -110,11 +125,11 @@ def testAndSolve(A, c, u, f, doTest=True, tol=1e-6):
             # "Matrix assembling finalize matrix" would also work
             tsup = timer["time"]
 
-    print("")
-    print(f"time AMG setup = {tsup} sec")
-    print(f"    set up  {A.height / tsup} DOFS/sec")
-    print(f"time solve = {t.time} sec")
-    print(f"    solved  {A.height / t.time} DOFS/sec")
+    mPrint("")
+    mPrint(f"time AMG setup = {tsup} sec")
+    mPrint(f"    set up  {A.height / tsup} DOFS/sec")
+    mPrint(f"time solve = {t.time} sec")
+    mPrint(f"    solved  {A.height / t.time} DOFS/sec")
 
     return kappa
 
@@ -249,6 +264,7 @@ def StokesHDGDiscretization(mesh, order, inlet, wall, div_div_pen, outlet, hodiv
 
 
 from ngsolve import *
+import mpi4py.MPI as MPI
 
 def MakeFacetBlocks(V, freedofs=None):
     blocks = []
@@ -263,11 +279,12 @@ def MakeFacetBlocks(V, freedofs=None):
             if len(block):
                 blocks.append(block)
 
-    totSize   = sum(len(x) for x in blocks)
-    totBlocks = len(blocks)
+    totSize   = MPI.COMM_WORLD.allreduce(sum(len(x) for x in blocks), op=MPI.SUM)
+    totBlocks = MPI.COMM_WORLD.allreduce(len(blocks), op=MPI.SUM)
     avgSize =  totSize / totBlocks
 
-    print(f"(globally) created {totBlocks} facet-blocks of average size {avgSize}")
+    if MPI.COMM_WORLD.rank == 0:
+        mPrint(f"(globally) created {totBlocks} facet-blocks of average size {avgSize}")
     return blocks
 
 class SmootherAsPrecond (BaseMatrix):
@@ -318,24 +335,29 @@ def TestSmoother(sm, a, isNGS, title):
     f[:] = 1.0
 
     tf = Timer("smooth - FW")
+    MPI.COMM_WORLD.Barrier()
     tf.Start()
     for k in range(N):
         sm.Smooth(u, f)
+    MPI.COMM_WORLD.Barrier()
     tf.Stop()
 
     tb = Timer("smooth - BW")
+    MPI.COMM_WORLD.Barrier()
     tb.Start()
     for k in range(N):
         sm.SmoothBack(u, f)
+    MPI.COMM_WORLD.Barrier()
     tb.Stop()
 
-    print(f"\nTesting smoother {title}:")
-    print(f"  If used as preconditioner:")
-    print(f"      lam min:   {lams[0]}")
-    print(f"      lam max:   {lams[-1]}")
-    print(f"      condition: {lams[-1] / lams[0]}")
-    print(f"  sec per smooth forward:   {tf.time/N}")
-    print(f"  sec per smooth backward:  {tb.time/N}")
+    if MPI.COMM_WORLD.rank == 0:
+        mPrint(f"\nTesting smoother {title}:")
+        mPrint(f"  If used as preconditioner:")
+        mPrint(f"      lam min:   {lams[0]}")
+        mPrint(f"      lam max:   {lams[-1]}")
+        mPrint(f"      condition: {lams[-1] / lams[0]}")
+        mPrint(f"  sec per smooth forward:   {tf.time/N}")
+        mPrint(f"  sec per smooth backward:  {tb.time/N}")
 
 
 def TestSPMV(a, title):
@@ -348,10 +370,13 @@ def TestSPMV(a, title):
     f[:] = 1.0
 
     tf = Timer("mult")
+    MPI.COMM_WORLD.Barrier()
     tf.Start()
     for k in range(N):
         u.data = a * f
+    MPI.COMM_WORLD.Barrier()
     tf.Stop()
 
-    print(f"\nTesting SPMV {title}:")
-    print(f"  sec per spmv:   {tf.time/N}")
+    if MPI.COMM_WORLD.rank == 0:
+        mPrint(f"\nTesting SPMV {title}:")
+        mPrint(f"  sec per spmv:   {tf.time/N}")
