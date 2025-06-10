@@ -91,7 +91,7 @@ def setupElastBeam(N=3, aRatio=10, pRatio = 0.1, elStretch=1, order=1, nodalP2=F
     gfu = ngs.GridFunction(V)
     return V, a, f, gfu
 
-def testAndSolve(A, c, u, f, doTest=True, tol=1e-6):
+def testAndSolve(A, c, u, f, doTest=True, tol=1e-6, isPETSc=False):
     evsA = ngs.la.EigenValues_Preconditioner(mat=A, pre=c)
     kappa = evsA[-1]/evsA[0]
 
@@ -119,15 +119,17 @@ def testAndSolve(A, c, u, f, doTest=True, tol=1e-6):
     MPI.COMM_WORLD.Barrier()
     t.Stop()
 
-    tsup = -1
-    for timer in ngs.Timers():
-        if timer["name"] == "BaseAMGPC::BuildAMGMat":
-            # "Matrix assembling finalize matrix" would also work
-            tsup = timer["time"]
+    if not isPETSc:
+        tsup = -1
+        for timer in ngs.Timers():
+            if timer["name"] == "BaseAMGPC::BuildAMGMat":
+                # "Matrix assembling finalize matrix" would also work
+                tsup = timer["time"]
 
     mPrint("")
-    mPrint(f"time AMG setup = {tsup} sec")
-    mPrint(f"    set up  {A.height / tsup} DOFS/sec")
+    if not isPETSc:
+        mPrint(f"time AMG setup = {tsup} sec")
+        mPrint(f"    set up  {A.height / tsup} DOFS/sec")
     mPrint(f"time solve = {t.time} sec")
     mPrint(f"    solved  {A.height / t.time} DOFS/sec")
 
